@@ -122,7 +122,10 @@ const App: React.FC = () => {
       return () => navigator.geolocation.clearWatch(watchId);
     }
     const savedHistory = localStorage.getItem('atc_history_v2');
-    if (savedHistory) setHistory(JSON.parse(savedHistory));
+    if (savedHistory) {
+      const parsed = JSON.parse(savedHistory);
+      setHistory(parsed.sort((a: any, b: any) => b.id.localeCompare(a.id)));
+    }
   }, []);
 
   // --- MOTION HANDLER ---
@@ -221,7 +224,7 @@ const App: React.FC = () => {
         data: [...dataRef.current],
         analysis: null
       };
-      const newHistory = [record, ...history].slice(0, 20);
+      const newHistory = [record, ...history].sort((a: any, b: any) => b.id.localeCompare(a.id)).slice(0, 30);
       setHistory(newHistory);
       localStorage.setItem('atc_history_v2', JSON.stringify(newHistory));
       setSelectedSession(record);
@@ -235,71 +238,6 @@ const App: React.FC = () => {
       setSyncPKValue('');
       if (audioSettings.sessionEvents) playTone(880, 0.1);
     }
-  };
-
-  const handleCSVImport = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const text = e.target?.result as string;
-      const rows = text.split('\n').filter(r => r.trim() !== '');
-      if (rows.length < 2) return;
-
-      const header = rows[0].toLowerCase();
-      const colIdx = {
-        pk: header.includes('pk') ? rows[0].split(',').findIndex(c => c.toLowerCase().includes('pk')) : -1,
-        y: header.includes('y') || header.includes('atc') ? rows[0].split(',').findIndex(c => c.toLowerCase().includes('y') || c.toLowerCase().includes('atc')) : -1,
-        z: header.includes('z') || header.includes('avc') ? rows[0].split(',').findIndex(c => c.toLowerCase().includes('z') || c.toLowerCase().includes('avc')) : -1
-      };
-
-      const importedData: AccelerationData[] = rows.slice(1).map((row, i) => {
-        const cells = row.split(',');
-        return {
-          timestamp: Date.now() + i * 20, // Assumé 50Hz si pas de timestamp
-          x: 0,
-          y: parseFloat(cells[colIdx.y]) || 0,
-          z: parseFloat(cells[colIdx.z]) || 0,
-          magnitude: 0,
-          pk: parseFloat(cells[colIdx.pk]) || 0
-        };
-      });
-
-      const maxZ = Math.max(...importedData.map(d => Math.abs(d.z)));
-      const maxY = Math.max(...importedData.map(d => Math.abs(d.y)));
-
-      const importedStats: SessionStats = {
-        startPK: importedData[0].pk || 0,
-        direction: 'croissant',
-        track: 'LGV1',
-        thresholdLA: 1.2, thresholdLI: 2.2, thresholdLAI: 2.8,
-        operator: 'IMPORT',
-        line: 'IMPORT_CSV',
-        train: 'EXTERNE',
-        engineNumber: 'N/A',
-        position: 'N/A',
-        note: `Fichier: ${file.name}`,
-        maxVertical: maxZ,
-        maxTransversal: maxY,
-        avgMagnitude: 0,
-        duration: importedData.length * 0.02,
-        countLA: 0, countLI: 0, countLAI: 0,
-        startTime: Date.now()
-      };
-
-      const record: SessionRecord = {
-        id: `import_${Date.now()}`,
-        date: new Date().toLocaleString('fr-FR'),
-        stats: importedStats,
-        data: importedData,
-        analysis: null
-      };
-
-      setHistory(prev => [record, ...prev].slice(0, 20));
-      setSelectedSession(record);
-    };
-    reader.readAsText(file);
   };
 
   const handleIAAnalysis = async () => {
@@ -317,6 +255,126 @@ const App: React.FC = () => {
     } finally {
       setIsAnalyzing(false);
     }
+  };
+
+  // --- CSV FUNCTIONS ---
+  const exportToCSV = (session: SessionRecord) => {
+    const headers = ['Timestamp', 'PK', 'X_Longitudinal', 'Y_Transversal_ATC', 'Z_Vertical_AVC', 'Magnitude'];
+    const rows = session.data.map(d => [
+      d.timestamp,
+      d.pk?.toFixed(5) || '',
+      d.x.toFixed(4),
+      d.y.toFixed(4),
+      d.z.toFixed(4),
+      d.magnitude.toFixed(4)
+    ]);
+
+    const csvContent = [
+      headers.join(','),
+      ...rows.map(r => r.join(','))
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `ATC_Session_${session.id}_${session.stats.track}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const exportAllHistoryToCSV = () => {
+    if (history.length === 0) return;
+    const headers = ['ID', 'Date', 'Operator', 'Line', 'Track', 'Train', 'Engine', 'StartPK', 'Direction', 'MaxVertical_AVC', 'MaxTransversal_ATC', 'LA_Alerts', 'LI_Alerts', 'LAI_Alerts', 'Compliance'];
+    const rows = history.map(h => [
+      h.id,
+      h.date,
+      h.stats.operator,
+      h.stats.line,
+      h.stats.track,
+      h.stats.train,
+      h.stats.engineNumber,
+      h.stats.startPK.toFixed(3),
+      h.stats.direction,
+      h.stats.maxVertical.toFixed(3),
+      h.stats.maxTransversal.toFixed(3),
+      h.stats.countLA,
+      h.stats.countLI,
+      h.stats.countLAI,
+      h.analysis?.complianceLevel || 'Non Analysé'
+    ]);
+
+    const csvContent = [
+      headers.join(','),
+      ...rows.map(r => r.join(','))
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `ATC_Global_Export_${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    if (audioSettings.sessionEvents) playTone(1200, 0.1);
+  };
+
+  const handleImportCSV = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result as string;
+      const lines = text.split('\n');
+      if (lines.length < 2) return;
+
+      const importedData: AccelerationData[] = [];
+      // On saute le header
+      for (let i = 1; i < lines.length; i++) {
+        const parts = lines[i].split(',');
+        if (parts.length < 6) continue;
+        importedData.push({
+          timestamp: parseInt(parts[0]),
+          pk: parseFloat(parts[1]),
+          x: parseFloat(parts[2]),
+          y: parseFloat(parts[3]),
+          z: parseFloat(parts[4]),
+          magnitude: parseFloat(parts[5])
+        });
+      }
+
+      if (importedData.length > 0) {
+        // Reconstruire une session basique
+        const first = importedData[0];
+        const last = importedData[importedData.length-1];
+        
+        const newRecord: SessionRecord = {
+          id: `import_${Date.now()}`,
+          date: `Imported ${new Date().toLocaleDateString()}`,
+          stats: {
+            ...stats,
+            startPK: first.pk || 0,
+            maxVertical: Math.max(...importedData.map(d => Math.abs(d.z))),
+            maxTransversal: Math.max(...importedData.map(d => Math.abs(d.y))),
+            duration: (last.timestamp - first.timestamp) / 1000,
+            startTime: first.timestamp
+          },
+          data: importedData,
+          analysis: null
+        };
+
+        const newHistory = [newRecord, ...history].sort((a: any, b: any) => b.id.localeCompare(a.id));
+        setHistory(newHistory);
+        localStorage.setItem('atc_history_v2', JSON.stringify(newHistory));
+        setSelectedSession(newRecord);
+        setError(null);
+      }
+    };
+    reader.readAsText(file);
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   return (
@@ -426,14 +484,20 @@ const App: React.FC = () => {
             {/* AI Result Section */}
             {selectedSession && !isMeasuring && (
               <div className="space-y-6">
-                <div className="flex gap-4">
+                <div className="flex flex-col sm:flex-row gap-4">
                   <button 
                     onClick={handleIAAnalysis} 
                     disabled={isAnalyzing}
-                    className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 h-16 rounded-2xl font-black text-sm flex items-center justify-center gap-3 shadow-xl shadow-indigo-900/20 transition-all"
+                    className="flex-[2] bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 h-16 rounded-2xl font-black text-sm flex items-center justify-center gap-3 shadow-xl shadow-indigo-900/20 transition-all"
                   >
                     {isAnalyzing ? <i className="fas fa-circle-notch fa-spin"></i> : <i className="fas fa-brain"></i>}
                     {isAnalyzing ? 'ANALYSE IA EN COURS...' : 'GÉNÉRER DIAGNOSTIC IA'}
+                  </button>
+                  <button 
+                    onClick={() => exportToCSV(selectedSession!)}
+                    className="flex-1 bg-slate-800 border border-slate-700 hover:bg-slate-700 h-16 rounded-2xl font-black text-xs uppercase tracking-widest flex items-center justify-center gap-3 transition-all"
+                  >
+                    <i className="fas fa-file-csv text-emerald-400"></i> Export CSV
                   </button>
                 </div>
 
@@ -598,60 +662,87 @@ const App: React.FC = () => {
                   <div className={`w-6 h-6 bg-white rounded-full shadow-lg transform transition-transform ${audioSettings.enabled ? 'translate-x-6' : 'translate-x-0'}`}></div>
                 </button>
               </div>
+
+              {/* Import UI */}
+              <div className="glass-card p-6 rounded-3xl border-slate-800/40 border-dashed flex flex-col items-center justify-center gap-4 text-center">
+                <div className="w-12 h-12 rounded-full bg-emerald-500/10 text-emerald-400 flex items-center justify-center text-xl">
+                  <i className="fas fa-file-import"></i>
+                </div>
+                <div>
+                  <h3 className="text-xs font-black uppercase tracking-widest mb-1">Importer une session CSV</h3>
+                  <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Recharger des données externes pour analyse</p>
+                </div>
+                <input type="file" accept=".csv" ref={fileInputRef} onChange={handleImportCSV} className="hidden" />
+                <button 
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-8 py-3 bg-slate-800 border border-slate-700 rounded-xl text-[10px] font-black uppercase tracking-[0.2em] hover:bg-slate-700 transition-all"
+                >
+                  Choisir un fichier .csv
+                </button>
+              </div>
             </section>
 
             {/* History Sidebar */}
             <aside className="space-y-6">
-              <div className="flex justify-between items-center px-2">
+              <div className="flex items-center justify-between px-2">
                 <h2 className="text-sm font-black text-slate-500 uppercase tracking-widest flex items-center gap-3">
                   <i className="fas fa-clock-rotate-left text-indigo-500"></i>
                   Recent Records
                 </h2>
-                <button 
-                  onClick={() => fileInputRef.current?.click()}
-                  className="w-10 h-10 bg-indigo-600/20 text-indigo-400 border border-indigo-500/30 rounded-xl hover:bg-indigo-600 hover:text-white transition-all shadow-lg flex items-center justify-center"
-                  title="Importer un fichier CSV"
-                >
-                  <i className="fas fa-file-import text-sm"></i>
-                </button>
-                <input 
-                  type="file" 
-                  ref={fileInputRef} 
-                  onChange={handleCSVImport} 
-                  accept=".csv" 
-                  className="hidden" 
-                />
+                <div className="flex items-center gap-2">
+                  <button 
+                    onClick={exportAllHistoryToCSV}
+                    disabled={history.length === 0}
+                    title="Export All Records to CSV"
+                    className="w-8 h-8 rounded-lg bg-indigo-600/20 text-indigo-400 border border-indigo-500/20 flex items-center justify-center hover:bg-indigo-600 hover:text-white transition-all disabled:opacity-30 disabled:pointer-events-none"
+                  >
+                    <i className="fas fa-file-export text-[10px]"></i>
+                  </button>
+                  <span className="text-[10px] font-mono text-slate-600 font-bold">{history.length} ITEMS</span>
+                </div>
               </div>
-
-              <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+              <div className="space-y-4 max-h-[700px] overflow-y-auto pr-2 custom-scrollbar">
                 {history.length === 0 ? (
                   <div className="glass-card p-8 rounded-3xl text-center border-dashed border-slate-800">
                     <i className="fas fa-folder-open text-slate-700 text-3xl mb-4"></i>
-                    <p className="text-xs text-slate-500 font-bold uppercase tracking-widest">No records found</p>
-                    <p className="text-[10px] text-slate-600 mt-2">Mesurez en direct ou importez un CSV.</p>
+                    <p className="text-xs text-slate-500 font-bold uppercase tracking-widest">No previous runs</p>
                   </div>
                 ) : (
                   history.map(record => (
                     <div 
                       key={record.id}
                       onClick={() => setSelectedSession(record)}
-                      className="glass-card p-5 rounded-2xl border-slate-800/40 hover:border-indigo-500/50 hover:bg-indigo-500/[0.02] transition-all cursor-pointer group"
+                      className="glass-card p-5 rounded-2xl border-slate-800/40 hover:border-indigo-500/50 hover:bg-indigo-500/[0.02] transition-all cursor-pointer group relative overflow-hidden"
                     >
+                      {record.analysis && (
+                        <div className="absolute top-0 right-0 p-1.5">
+                           <div className="bg-emerald-500/20 text-emerald-400 w-6 h-6 rounded-lg flex items-center justify-center animate-pulse">
+                              <i className="fas fa-brain text-[10px]"></i>
+                           </div>
+                        </div>
+                      )}
                       <div className="flex justify-between items-start mb-3">
-                         <div className="flex gap-2">
-                            <span className="text-[10px] font-mono text-indigo-400 font-bold">{record.date.split(' ')[0]}</span>
-                            {record.id.startsWith('import') && (
-                              <span className="text-[8px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded border border-indigo-500/30 font-black uppercase">Import</span>
-                            )}
-                         </div>
-                         {record.analysis && <i className="fas fa-brain text-[10px] text-emerald-400"></i>}
+                         <span className="text-[10px] font-mono text-indigo-400 font-bold tracking-tighter">
+                           {record.date}
+                         </span>
                       </div>
-                      <div className="font-bold text-sm mb-1 group-hover:text-indigo-300 transition-colors uppercase">
-                        {record.stats.operator === 'IMPORT' ? record.stats.note : `VOIE ${record.stats.track} — ${record.stats.line}`}
+                      <div className="font-bold text-sm mb-1 group-hover:text-indigo-300 transition-colors">
+                        VOIE {record.stats.track || '?' } — {record.stats.line}
                       </div>
-                      <div className="flex items-center gap-4 text-[9px] font-black text-slate-500 uppercase tracking-widest">
-                         <span>PK {record.stats.startPK.toFixed(3)}</span>
-                         <span>Max γz: {record.stats.maxVertical.toFixed(2)}</span>
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-3 text-[9px] font-black text-slate-500 uppercase tracking-widest">
+                           <span className="flex items-center gap-1"><i className="fas fa-map-pin text-blue-500"></i> PK {record.stats.startPK.toFixed(3)}</span>
+                           <span className="flex items-center gap-1"><i className="fas fa-arrows-up-down text-emerald-500"></i> γz: {record.stats.maxVertical.toFixed(2)}</span>
+                        </div>
+                        <div className="flex items-center gap-2 mt-1">
+                          <div className={`h-1 flex-1 rounded-full bg-slate-800`}>
+                            <div 
+                              className={`h-full rounded-full ${record.stats.countLAI > 0 ? 'bg-red-500' : record.stats.countLI > 0 ? 'bg-orange-500' : 'bg-indigo-500'}`}
+                              style={{ width: `${Math.min(100, (record.stats.countLA + record.stats.countLI + record.stats.countLAI) * 5)}%` }}
+                            ></div>
+                          </div>
+                          <span className="text-[8px] font-mono text-slate-600">{record.data.length} pts</span>
+                        </div>
                       </div>
                     </div>
                   ))
@@ -673,7 +764,7 @@ const App: React.FC = () => {
         </button>
         <div className="flex flex-col items-center gap-1.5 opacity-30">
           <span className="text-[10px] font-black text-white tracking-tighter">ATC LACHGUER</span>
-          <span className="text-[7px] font-mono">2.2.0-PRO</span>
+          <span className="text-[7px] font-mono">2.4.0-PRO</span>
         </div>
       </footer>
 
