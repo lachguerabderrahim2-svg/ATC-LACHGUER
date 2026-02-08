@@ -3,16 +3,21 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { AccelerationData, SessionStats, GeminiAnalysis, PKDirection, TrackType, SessionRecord, AudioSettings } from './types';
 import { MotionChart } from './components/MotionChart';
 import { ValueDisplay } from './components/ValueDisplay';
-import { analyzeMotionSession } from './services/geminiService';
+import { analyzeMotionSession, generateSpeech, findNearbyFacilities } from './services/geminiService';
 
 const App: React.FC = () => {
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [data, setData] = useState<AccelerationData[]>([]);
   const [currentAccel, setCurrentAccel] = useState<AccelerationData>({ timestamp: 0, x: 0, y: 0, z: 0, magnitude: 0 });
   
+  // Permissions & Capteurs Status
+  const [gpsStatus, setGpsStatus] = useState<'pending' | 'granted' | 'denied'>('pending');
+  const [motionStatus, setMotionStatus] = useState<'pending' | 'granted' | 'denied'>('pending');
+
   // Vitesse et GPS
   const [speedKmh, setSpeedKmh] = useState<number>(0); 
   const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
+  const [userLocation, setUserLocation] = useState<{lat: number, lng: number} | null>(null);
 
   // Configuration
   const [startPK, setStartPK] = useState<string>('0.000');
@@ -53,6 +58,9 @@ const App: React.FC = () => {
   });
 
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isSearchingMaps, setIsSearchingMaps] = useState(false);
+  const [mapsResults, setMapsResults] = useState<{text: string, links: any[]} | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const dataRef = useRef<AccelerationData[]>([]);
@@ -106,25 +114,73 @@ const App: React.FC = () => {
     } catch (e) {}
   };
 
-  // --- GPS ---
-  useEffect(() => {
+  // --- PERMISSIONS HANDLER ---
+  const requestAllPermissions = async () => {
+    setError(null);
+    
+    // GPS
     if ('geolocation' in navigator) {
-      const watchId = navigator.geolocation.watchPosition(
+      navigator.geolocation.getCurrentPosition(
         (pos) => {
-          const speed = (pos.coords.speed || 0) * 3.6;
-          setSpeedKmh(speed);
-          currentSpeedRef.current = pos.coords.speed || 0;
-          setGpsAccuracy(pos.coords.accuracy);
+          setGpsStatus('granted');
+          setUserLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+          setupGpsWatch();
         },
-        null,
-        { enableHighAccuracy: true, maximumAge: 500 }
+        (err) => {
+          setGpsStatus('denied');
+          console.error("GPS Denied", err);
+        },
+        { enableHighAccuracy: true }
       );
-      return () => navigator.geolocation.clearWatch(watchId);
+    } else {
+      setGpsStatus('denied');
     }
+
+    // Motion Sensors (Accéléromètre)
+    if (typeof DeviceMotionEvent !== 'undefined' && (DeviceMotionEvent as any).requestPermission === 'function') {
+      try {
+        const res = await (DeviceMotionEvent as any).requestPermission();
+        setMotionStatus(res === 'granted' ? 'granted' : 'denied');
+      } catch (err) {
+        setMotionStatus('denied');
+        console.error("Motion Permission Error", err);
+      }
+    } else {
+      // Android / Desktop non-iOS : généralement accordé par défaut si HTTPS
+      setMotionStatus('granted');
+    }
+  };
+
+  const setupGpsWatch = () => {
+    navigator.geolocation.watchPosition(
+      (pos) => {
+        const speed = (pos.coords.speed || 0) * 3.6;
+        setSpeedKmh(speed);
+        currentSpeedRef.current = pos.coords.speed || 0;
+        setGpsAccuracy(pos.coords.accuracy);
+        setUserLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      },
+      null,
+      { enableHighAccuracy: true, maximumAge: 500 }
+    );
+  };
+
+  // --- INITIALIZATION ---
+  useEffect(() => {
     const savedHistory = localStorage.getItem('atc_history_v2');
     if (savedHistory) {
       const parsed = JSON.parse(savedHistory);
       setHistory(parsed.sort((a: any, b: any) => b.id.localeCompare(a.id)));
+    }
+
+    // Tenter de détecter l'état GPS si déjà autorisé
+    if ('permissions' in navigator) {
+      navigator.permissions.query({ name: 'geolocation' as any }).then(status => {
+        if (status.state === 'granted') {
+          setGpsStatus('granted');
+          setupGpsWatch();
+        }
+      });
     }
   }, []);
 
@@ -186,9 +242,13 @@ const App: React.FC = () => {
 
   const toggleMeasurement = async () => {
     if (!isMeasuring) {
-      if (typeof DeviceMotionEvent !== 'undefined' && (DeviceMotionEvent as any).requestPermission === 'function') {
-        const res = await (DeviceMotionEvent as any).requestPermission();
-        if (res !== 'granted') { setError("Permission refusée."); return; }
+      // Re-vérification des permissions
+      if (motionStatus !== 'granted' || gpsStatus !== 'granted') {
+        await requestAllPermissions();
+        if (motionStatus !== 'granted') {
+          setError("Les capteurs de mouvement ne sont pas autorisés.");
+          return;
+        }
       }
 
       setError(null);
@@ -244,6 +304,7 @@ const App: React.FC = () => {
     const s = selectedSession;
     if (!s || s.data.length < 10) return;
     setIsAnalyzing(true);
+    setMapsResults(null);
     try {
       const result = await analyzeMotionSession(s.data, s.stats);
       const updated = history.map(h => h.id === s.id ? { ...h, analysis: result } : h);
@@ -257,7 +318,48 @@ const App: React.FC = () => {
     }
   };
 
-  // --- CSV FUNCTIONS ---
+  const handleSpeak = async () => {
+    if (!selectedSession?.analysis) return;
+    setIsSpeaking(true);
+    try {
+      const textToSpeak = `Diagnostic expert : ${selectedSession.analysis.complianceLevel}. ${selectedSession.analysis.observations.join('. ')}. Recommandations : ${selectedSession.analysis.recommendations}`;
+      const base64Audio = await generateSpeech(textToSpeak);
+      if (base64Audio) {
+        const audioData = atob(base64Audio);
+        const arrayBuffer = new ArrayBuffer(audioData.length);
+        const view = new Uint8Array(arrayBuffer);
+        for (let i = 0; i < audioData.length; i++) {
+          view[i] = audioData.charCodeAt(i);
+        }
+        
+        const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        audio.onended = () => setIsSpeaking(false);
+        audio.play();
+      }
+    } catch (e: any) {
+      console.error(e);
+      setIsSpeaking(false);
+    }
+  };
+
+  const handleSearchNearby = async () => {
+    if (!userLocation) {
+      setError("Localisation indisponible pour la recherche Maps.");
+      return;
+    }
+    setIsSearchingMaps(true);
+    try {
+      const results = await findNearbyFacilities(userLocation.lat, userLocation.lng);
+      setMapsResults(results);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setIsSearchingMaps(false);
+    }
+  };
+
   const exportToCSV = (session: SessionRecord) => {
     const headers = ['Timestamp', 'PK', 'X_Longitudinal', 'Y_Transversal_ATC', 'Z_Vertical_AVC', 'Magnitude'];
     const rows = session.data.map(d => [
@@ -268,17 +370,12 @@ const App: React.FC = () => {
       d.z.toFixed(4),
       d.magnitude.toFixed(4)
     ]);
-
-    const csvContent = [
-      headers.join(','),
-      ...rows.map(r => r.join(','))
-    ].join('\n');
-
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.setAttribute('href', url);
-    link.setAttribute('download', `ATC_Session_${session.id}_${session.stats.track}.csv`);
+    link.setAttribute('download', `ATC_Session_${session.id}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -288,33 +385,16 @@ const App: React.FC = () => {
     if (history.length === 0) return;
     const headers = ['ID', 'Date', 'Operator', 'Line', 'Track', 'Train', 'Engine', 'StartPK', 'Direction', 'MaxVertical_AVC', 'MaxTransversal_ATC', 'LA_Alerts', 'LI_Alerts', 'LAI_Alerts', 'Compliance'];
     const rows = history.map(h => [
-      h.id,
-      h.date,
-      h.stats.operator,
-      h.stats.line,
-      h.stats.track,
-      h.stats.train,
-      h.stats.engineNumber,
-      h.stats.startPK.toFixed(3),
-      h.stats.direction,
-      h.stats.maxVertical.toFixed(3),
-      h.stats.maxTransversal.toFixed(3),
-      h.stats.countLA,
-      h.stats.countLI,
-      h.stats.countLAI,
-      h.analysis?.complianceLevel || 'Non Analysé'
+      h.id, h.date, h.stats.operator, h.stats.line, h.stats.track, h.stats.train, h.stats.engineNumber,
+      h.stats.startPK.toFixed(3), h.stats.direction, h.stats.maxVertical.toFixed(3), h.stats.maxTransversal.toFixed(3),
+      h.stats.countLA, h.stats.countLI, h.stats.countLAI, h.analysis?.complianceLevel || 'Non Analysé'
     ]);
-
-    const csvContent = [
-      headers.join(','),
-      ...rows.map(r => r.join(','))
-    ].join('\n');
-
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.setAttribute('href', url);
-    link.setAttribute('download', `ATC_Global_Export_${new Date().toISOString().split('T')[0]}.csv`);
+    link.setAttribute('download', `ATC_Global_Export.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -324,15 +404,12 @@ const App: React.FC = () => {
   const handleImportCSV = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
     const reader = new FileReader();
     reader.onload = (e) => {
       const text = e.target?.result as string;
       const lines = text.split('\n');
       if (lines.length < 2) return;
-
       const importedData: AccelerationData[] = [];
-      // On saute le header
       for (let i = 1; i < lines.length; i++) {
         const parts = lines[i].split(',');
         if (parts.length < 6) continue;
@@ -345,12 +422,9 @@ const App: React.FC = () => {
           magnitude: parseFloat(parts[5])
         });
       }
-
       if (importedData.length > 0) {
-        // Reconstruire une session basique
         const first = importedData[0];
         const last = importedData[importedData.length-1];
-        
         const newRecord: SessionRecord = {
           id: `import_${Date.now()}`,
           date: `Imported ${new Date().toLocaleDateString()}`,
@@ -365,7 +439,6 @@ const App: React.FC = () => {
           data: importedData,
           analysis: null
         };
-
         const newHistory = [newRecord, ...history].sort((a: any, b: any) => b.id.localeCompare(a.id));
         setHistory(newHistory);
         localStorage.setItem('atc_history_v2', JSON.stringify(newHistory));
@@ -424,6 +497,38 @@ const App: React.FC = () => {
           <div className="bg-red-500/10 border border-red-500/40 p-4 rounded-2xl flex items-center gap-3 text-red-400 text-xs font-bold animate-in fade-in zoom-in duration-300">
             <i className="fas fa-triangle-exclamation text-lg"></i>
             {error}
+          </div>
+        )}
+
+        {/* Readiness Section */}
+        {!isMeasuring && !selectedSession && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 animate-in slide-in-from-top-4 duration-500">
+            <div className={`glass-card p-6 rounded-3xl border ${motionStatus === 'granted' ? 'border-emerald-500/20 bg-emerald-500/5' : 'border-red-500/20 bg-red-500/5'}`}>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Capteurs de Mouvement</span>
+                <i className={`fas ${motionStatus === 'granted' ? 'fa-check-circle text-emerald-500' : 'fa-times-circle text-red-500'}`}></i>
+              </div>
+              <p className="text-[10px] text-slate-500 font-bold uppercase">{motionStatus === 'granted' ? 'Accéléromètres Activés' : 'Accès Restreint'}</p>
+            </div>
+            <div className={`glass-card p-6 rounded-3xl border ${gpsStatus === 'granted' ? 'border-emerald-500/20 bg-emerald-500/5' : 'border-red-500/20 bg-red-500/5'}`}>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Positionnement GPS</span>
+                <i className={`fas ${gpsStatus === 'granted' ? 'fa-satellite text-emerald-500' : 'fa-location-dot text-red-500'}`}></i>
+              </div>
+              <p className="text-[10px] text-slate-500 font-bold uppercase">{gpsStatus === 'granted' ? 'Géolocalisation Active' : 'GPS Non Autorisé'}</p>
+            </div>
+            <button 
+              onClick={requestAllPermissions}
+              className="glass-card p-6 rounded-3xl border border-indigo-500/30 bg-indigo-500/10 flex items-center justify-center gap-4 hover:bg-indigo-500/20 transition-all group"
+            >
+              <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center group-hover:scale-110 transition-transform">
+                <i className="fas fa-lock-open text-white"></i>
+              </div>
+              <div className="text-left">
+                <p className="text-xs font-black text-white uppercase tracking-widest">Autoriser les Capteurs</p>
+                <p className="text-[9px] text-indigo-400 font-bold uppercase">Initialiser les accès</p>
+              </div>
+            </button>
           </div>
         )}
 
@@ -505,19 +610,30 @@ const App: React.FC = () => {
                   <div className="glass-card border-indigo-500/30 bg-indigo-500/5 p-8 rounded-3xl animate-in fade-in slide-in-from-top-4 duration-500">
                     <div className="flex flex-col md:flex-row justify-between gap-6 mb-8">
                       <div className="flex items-center gap-4">
-                        <div className="w-14 h-14 bg-indigo-600 rounded-2xl flex items-center justify-center text-2xl shadow-lg">
+                        <div className="w-14 h-14 bg-indigo-600 rounded-2xl flex items-center justify-center text-2xl shadow-lg relative">
                           <i className="fas fa-robot text-white"></i>
+                          {isSpeaking && <div className="absolute -top-1 -right-1 w-3 h-3 bg-emerald-500 rounded-full animate-ping"></div>}
                         </div>
                         <div>
                           <h3 className="font-black text-xl text-white tracking-tight">Expertise Infrastructure</h3>
                           <p className="text-xs text-indigo-400 font-bold uppercase tracking-widest">{selectedSession.analysis.activityType}</p>
                         </div>
                       </div>
-                      <div className={`self-start px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest shadow-lg ${
-                        selectedSession.analysis.complianceLevel === 'Conforme' ? 'bg-emerald-500 text-white' :
-                        selectedSession.analysis.complianceLevel === 'Surveillance' ? 'bg-orange-500 text-white' : 'bg-red-500 text-white'
-                      }`}>
-                        Statut: {selectedSession.analysis.complianceLevel}
+                      <div className="flex gap-3">
+                         <button 
+                            onClick={handleSpeak}
+                            disabled={isSpeaking}
+                            className="w-10 h-10 bg-slate-800 rounded-xl flex items-center justify-center hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                            title="Lire le diagnostic"
+                          >
+                            <i className={`fas ${isSpeaking ? 'fa-spinner fa-spin' : 'fa-volume-up'}`}></i>
+                         </button>
+                        <div className={`self-start px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest shadow-lg ${
+                          selectedSession.analysis.complianceLevel === 'Conforme' ? 'bg-emerald-500 text-white' :
+                          selectedSession.analysis.complianceLevel === 'Surveillance' ? 'bg-orange-500 text-white' : 'bg-red-500 text-white'
+                        }`}>
+                          Statut: {selectedSession.analysis.complianceLevel}
+                        </div>
                       </div>
                     </div>
 
@@ -556,6 +672,33 @@ const App: React.FC = () => {
                             </p>
                          </div>
                       </div>
+                    </div>
+
+                    <div className="mt-8 pt-8 border-t border-slate-800/50">
+                       <button 
+                        onClick={handleSearchNearby}
+                        disabled={isSearchingMaps}
+                        className="w-full h-12 bg-emerald-600/10 border border-emerald-500/30 rounded-xl text-emerald-400 font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-3 hover:bg-emerald-600 hover:text-white transition-all"
+                       >
+                         {isSearchingMaps ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-location-arrow"></i>}
+                         Rechercher Points de Maintenance Proches (Google Maps)
+                       </button>
+
+                       {mapsResults && (
+                         <div className="mt-6 bg-slate-900/80 rounded-2xl p-6 border border-emerald-500/20 animate-in fade-in duration-300">
+                           <h5 className="text-[10px] font-black text-emerald-400 uppercase tracking-[0.2em] mb-4">Établissements Ferroviaires à Proximité</h5>
+                           <div className="prose prose-invert prose-xs text-slate-300 mb-6">
+                             {mapsResults.text}
+                           </div>
+                           <div className="space-y-2">
+                             {mapsResults.links.map((chunk: any, i: number) => chunk.maps && (
+                               <a key={i} href={chunk.maps.uri} target="_blank" rel="noopener noreferrer" className="block p-3 bg-slate-800 rounded-lg text-[10px] font-bold text-indigo-400 border border-slate-700 hover:border-indigo-500 transition-colors">
+                                 <i className="fas fa-external-link-alt mr-2"></i> {chunk.maps.title || "Voir sur Google Maps"}
+                               </a>
+                             ))}
+                           </div>
+                         </div>
+                       )}
                     </div>
                   </div>
                 )}
@@ -729,6 +872,10 @@ const App: React.FC = () => {
                       <div className="font-bold text-sm mb-1 group-hover:text-indigo-300 transition-colors">
                         VOIE {record.stats.track || '?' } — {record.stats.line}
                       </div>
+                      <div className="flex items-center gap-2 text-[8px] font-black text-slate-400 uppercase mb-3">
+                        <i className="fas fa-user-gear text-indigo-500"></i>
+                        ID OP: {record.stats.operator || 'UNKNOWN'}
+                      </div>
                       <div className="flex flex-col gap-1">
                         <div className="flex items-center gap-3 text-[9px] font-black text-slate-500 uppercase tracking-widest">
                            <span className="flex items-center gap-1"><i className="fas fa-map-pin text-blue-500"></i> PK {record.stats.startPK.toFixed(3)}</span>
@@ -764,7 +911,7 @@ const App: React.FC = () => {
         </button>
         <div className="flex flex-col items-center gap-1.5 opacity-30">
           <span className="text-[10px] font-black text-white tracking-tighter">ATC LACHGUER</span>
-          <span className="text-[7px] font-mono">2.4.0-PRO</span>
+          <span className="text-[7px] font-mono">2.6.0-PRO</span>
         </div>
       </footer>
 
