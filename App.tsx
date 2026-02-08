@@ -4,8 +4,6 @@ import { AccelerationData, SessionStats, GeminiAnalysis, PKDirection, TrackType,
 import { MotionChart } from './components/MotionChart';
 import { ValueDisplay } from './components/ValueDisplay';
 import { analyzeMotionSession } from './services/geminiService';
-import { jsPDF } from 'jspdf';
-import html2canvas from 'html2canvas';
 
 const App: React.FC = () => {
   const [isMeasuring, setIsMeasuring] = useState(false);
@@ -13,25 +11,28 @@ const App: React.FC = () => {
   const [currentAccel, setCurrentAccel] = useState<AccelerationData>({ timestamp: 0, x: 0, y: 0, z: 0, magnitude: 0 });
   
   // Vitesse et GPS
-  const [speedMps, setSpeedMps] = useState<number>(0); 
+  const [speedKmh, setSpeedKmh] = useState<number>(0); 
   const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
 
-  // Config Session & Métadonnées
-  const [startPK, setStartPK] = useState<string>('');
+  // Configuration
+  const [startPK, setStartPK] = useState<string>('0.000');
   const [direction, setDirection] = useState<PKDirection>('croissant');
-  const [track, setTrack] = useState<TrackType>('');
+  const [track, setTrack] = useState<TrackType>('LGV1');
   const [la, setLa] = useState<number>(1.2);
   const [li, setLi] = useState<number>(2.2);
   const [lai, setLai] = useState<number>(2.8);
   
-  const [operator, setOperator] = useState<string>('LACHGUER');
-  const [line, setLine] = useState<string>('KENITRA/TANGER');
+  const [operator, setOperator] = useState<string>('TECH_ATC');
+  const [line, setLine] = useState<string>('LGV');
   const [train, setTrain] = useState<string>('RGV');
-  const [engineNumber, setEngineNumber] = useState<string>('1208M1');
+  const [engineNumber, setEngineNumber] = useState<string>('');
   const [position, setPosition] = useState<string>('EN QUEUE');
   const [note, setNote] = useState<string>('');
 
-  // Audio & WakeLock States
+  // Recalage PK
+  const [syncPKValue, setSyncPKValue] = useState<string>('');
+
+  // Audio & WakeLock
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({
     enabled: true,
     alertLA: true,
@@ -45,43 +46,32 @@ const App: React.FC = () => {
   const [history, setHistory] = useState<SessionRecord[]>([]);
   const [selectedSession, setSelectedSession] = useState<SessionRecord | null>(null);
 
-  // Modal Export PDF
-  const [isPDFModalOpen, setIsPDFModalOpen] = useState(false);
-  const [exportPKStart, setExportPKStart] = useState<string>('');
-  const [exportPKEnd, setExportPKEnd] = useState<string>('');
-
   const [stats, setStats] = useState<SessionStats>({ 
     startPK: 0, direction: 'croissant', track: '', thresholdLA: 1.2, thresholdLI: 2.2, thresholdLAI: 2.8,
-    operator: 'LACHGUER', line: 'KENITRA/TANGER', train: 'RGV', engineNumber: '1208M1', position: 'EN QUEUE', note: '',
-    maxVertical: 0, maxTransversal: 0, avgMagnitude: 0, duration: 0, countLA: 0, countLI: 0, countLAI: 0 
+    operator: '', line: '', train: '', engineNumber: '', position: '', note: '',
+    maxVertical: 0, maxTransversal: 0, avgMagnitude: 0, duration: 0, countLA: 0, countLI: 0, countLAI: 0, startTime: 0
   });
 
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analysis, setAnalysis] = useState<GeminiAnalysis | null>(null);
-  const [permissionGranted, setPermissionGranted] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const dataRef = useRef<AccelerationData[]>([]);
   const lastTimestampRef = useRef<number>(0);
   const currentPKRef = useRef<number>(0);
   const currentSpeedRef = useRef<number>(0);
-  const chartContainerRef = useRef<HTMLDivElement>(null);
-  const watchIdRef = useRef<number | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const wakeLockRef = useRef<any>(null);
   const lastBeepTimeRef = useRef<number>(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // --- WAKE LOCK API ---
+  // --- WAKE LOCK ---
   const requestWakeLock = async () => {
     if ('wakeLock' in navigator) {
       try {
         wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
         setIsWakeLocked(true);
-        wakeLockRef.current.addEventListener('release', () => {
-          setIsWakeLocked(false);
-        });
       } catch (err: any) {
-        console.error(`${err.name}, ${err.message}`);
+        console.error("WakeLock failed", err);
       }
     }
   };
@@ -90,20 +80,11 @@ const App: React.FC = () => {
     if (wakeLockRef.current) {
       await wakeLockRef.current.release();
       wakeLockRef.current = null;
+      setIsWakeLocked(false);
     }
   };
 
-  useEffect(() => {
-    const handleVisibilityChange = async () => {
-      if (wakeLockRef.current !== null && document.visibilityState === 'visible' && isMeasuring) {
-        await requestWakeLock();
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [isMeasuring]);
-
-  // --- AUDIO FEEDBACK ---
+  // --- AUDIO ---
   const playTone = (freq: number, duration: number, type: OscillatorType = 'sine', volume: number = 0.1) => {
     if (!audioSettings.enabled) return;
     try {
@@ -112,704 +93,607 @@ const App: React.FC = () => {
       }
       const ctx = audioCtxRef.current;
       if (ctx.state === 'suspended') ctx.resume();
-
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-
       osc.type = type;
       osc.frequency.setValueAtTime(freq, ctx.currentTime);
-      
       gain.gain.setValueAtTime(volume, ctx.currentTime);
       gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + duration);
-
       osc.connect(gain);
       gain.connect(ctx.destination);
-
       osc.start();
       osc.stop(ctx.currentTime + duration);
-    } catch (e) {
-      console.warn("Audio playback failed", e);
+    } catch (e) {}
+  };
+
+  // --- GPS ---
+  useEffect(() => {
+    if ('geolocation' in navigator) {
+      const watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          const speed = (pos.coords.speed || 0) * 3.6;
+          setSpeedKmh(speed);
+          currentSpeedRef.current = pos.coords.speed || 0;
+          setGpsAccuracy(pos.coords.accuracy);
+        },
+        null,
+        { enableHighAccuracy: true, maximumAge: 500 }
+      );
+      return () => navigator.geolocation.clearWatch(watchId);
     }
-  };
+    const savedHistory = localStorage.getItem('atc_history_v2');
+    if (savedHistory) setHistory(JSON.parse(savedHistory));
+  }, []);
 
-  const playStartSound = () => {
-    if (!audioSettings.sessionEvents) return;
-    playTone(440, 0.1);
-    setTimeout(() => playTone(554.37, 0.1), 100);
-    setTimeout(() => playTone(659.25, 0.2), 200);
-  };
-
-  const playStopSound = () => {
-    if (!audioSettings.sessionEvents) return;
-    playTone(659.25, 0.1);
-    setTimeout(() => playTone(554.37, 0.1), 100);
-    setTimeout(() => playTone(440, 0.2), 200);
-  };
-
-  const requestPermissions = async () => {
-    try {
-      if (typeof DeviceMotionEvent !== 'undefined' && (DeviceMotionEvent as any).requestPermission === 'function') {
-        const response = await (DeviceMotionEvent as any).requestPermission();
-        if (response === 'granted') {
-          setPermissionGranted(true);
-          setError(null);
-        } else {
-          setPermissionGranted(false);
-          setError("L'accès aux capteurs de mouvement a été refusé.");
-        }
-      } else {
-        setPermissionGranted(true);
-      }
-
-      if ('geolocation' in navigator) {
-        if (watchIdRef.current !== null) {
-          navigator.geolocation.clearWatch(watchIdRef.current);
-        }
-        watchIdRef.current = navigator.geolocation.watchPosition(
-          (position) => {
-            const speed = position.coords.speed || 0;
-            setSpeedMps(speed);
-            currentSpeedRef.current = speed;
-            setGpsAccuracy(position.coords.accuracy);
-          },
-          (err) => {
-            console.warn("Geolocation tracking error:", err);
-            setGpsAccuracy(null);
-          },
-          { enableHighAccuracy: true, maximumAge: 1000 }
-        );
-      }
-    } catch (e) {
-      console.error("Error requesting permissions:", e);
-      setError("Une erreur est survenue lors de la demande de permissions.");
-      setPermissionGranted(true);
-    }
-  };
-
+  // --- MOTION HANDLER ---
   const handleMotion = useCallback((event: DeviceMotionEvent) => {
     const accel = event.acceleration;
     if (!accel || accel.x === null || accel.y === null || accel.z === null) return;
 
-    const timestamp = Date.now();
-    const dt = lastTimestampRef.current === 0 ? 0 : (timestamp - lastTimestampRef.current) / 1000;
-    lastTimestampRef.current = timestamp;
+    const now = Date.now();
+    const dt = lastTimestampRef.current === 0 ? 0 : (now - lastTimestampRef.current) / 1000;
+    lastTimestampRef.current = now;
 
-    const deltaDistanceKm = (currentSpeedRef.current * dt) / 1000;
-    
-    if (deltaDistanceKm > 0) {
-      if (direction === 'croissant') {
-        currentPKRef.current += deltaDistanceKm;
-      } else {
-        currentPKRef.current -= deltaDistanceKm;
-      }
+    // Calcul PK
+    const deltaDist = currentSpeedRef.current * dt;
+    if (deltaDist > 0) {
+      currentPKRef.current += (direction === 'croissant' ? deltaDist : -deltaDist) / 1000;
     }
 
-    const x = accel.x || 0;
-    const y = accel.y || 0;
-    const z = accel.z || 0;
-    const magnitude = Math.sqrt(x * x + y * y + z * z);
-    const duration = (timestamp - (dataRef.current[0]?.timestamp || timestamp)) / 1000;
+    const x = accel.x;
+    const y = accel.y; // Transversal (ATC / Dressage)
+    const z = accel.z; // Vertical (AVC / Nivellement)
+    const magnitude = Math.sqrt(x*x + y*y + z*z);
 
     const newData: AccelerationData = { 
-      timestamp, x, y, z, magnitude, pk: currentPKRef.current 
+      timestamp: now, x, y, z, magnitude, pk: currentPKRef.current 
     };
     
-    setCurrentAccel(newData);
     dataRef.current.push(newData);
+    setCurrentAccel(newData);
 
+    // Seuils Audio (ATC uniquement)
     const absY = Math.abs(y);
-    const absZ = Math.abs(z);
-    const now = Date.now();
-    
-    if (now - lastBeepTimeRef.current > 500) {
-        if (absY >= lai && audioSettings.alertLAI) {
-          playTone(1200, 0.3, 'square', 0.15);
-          lastBeepTimeRef.current = now;
-        } else if (absY >= li && audioSettings.alertLI) {
-          playTone(800, 0.2, 'sine', 0.1);
-          lastBeepTimeRef.current = now;
-        } else if (absY >= la && audioSettings.alertLA) {
-          playTone(400, 0.1, 'sine', 0.05);
-          lastBeepTimeRef.current = now;
-        }
+    if (now - lastBeepTimeRef.current > 400) {
+      if (absY >= lai) { playTone(1500, 0.4, 'square', 0.1); lastBeepTimeRef.current = now; }
+      else if (absY >= li) { playTone(1000, 0.3, 'sine', 0.1); lastBeepTimeRef.current = now; }
+      else if (absY >= la) { playTone(600, 0.2, 'sine', 0.05); lastBeepTimeRef.current = now; }
     }
-    
-    setStats(prev => {
-      let nLA = prev.countLA;
-      let nLI = prev.countLI;
-      let nLAI = prev.countLAI;
 
-      if (absY >= lai) nLAI++;
-      else if (absY >= li) nLI++;
-      else if (absY >= la) nLA++;
-
-      return {
-        ...prev,
-        maxVertical: Math.max(prev.maxVertical, absZ),
-        maxTransversal: Math.max(prev.maxTransversal, Math.abs(x), absY),
-        avgMagnitude: (prev.avgMagnitude * (dataRef.current.length - 1) + magnitude) / dataRef.current.length,
-        duration: duration,
-        countLA: nLA,
-        countLI: nLI,
-        countLAI: nLAI
-      };
-    });
-
-    if (dataRef.current.length % 5 === 0) setData([...dataRef.current]);
-  }, [la, li, lai, direction, audioSettings]);
-
-  useEffect(() => {
-    if (isMeasuring && permissionGranted) {
-      lastTimestampRef.current = Date.now();
-      window.addEventListener('devicemotion', handleMotion);
-    } else {
-      window.removeEventListener('devicemotion', handleMotion);
+    // Update Stats
+    if (dataRef.current.length % 5 === 0) {
+      setData([...dataRef.current]);
+      setStats(prev => {
+        let nLA = prev.countLA;
+        let nLI = prev.countLI;
+        let nLAI = prev.countLAI;
+        if (absY >= lai) nLAI++; else if (absY >= li) nLI++; else if (absY >= la) nLA++;
+        
+        return {
+          ...prev,
+          maxVertical: Math.max(prev.maxVertical, Math.abs(z)),
+          maxTransversal: Math.max(prev.maxTransversal, absY),
+          avgMagnitude: (prev.avgMagnitude * (dataRef.current.length - 1) + magnitude) / dataRef.current.length,
+          duration: (now - prev.startTime) / 1000,
+          countLA: nLA, countLI: nLI, countLAI: nLAI
+        };
+      });
     }
-    return () => {
-      window.removeEventListener('devicemotion', handleMotion);
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-        watchIdRef.current = null;
-      }
-    };
-  }, [isMeasuring, permissionGranted, handleMotion]);
+  }, [direction, la, li, lai]);
 
   const toggleMeasurement = async () => {
-    if (!permissionGranted) {
-      await requestPermissions();
-      return;
-    }
-
     if (!isMeasuring) {
-      if (startPK.trim() === '' || track === '') {
-        setError("Veuillez renseigner le PK de départ et la Voie avant de commencer.");
-        return;
+      if (typeof DeviceMotionEvent !== 'undefined' && (DeviceMotionEvent as any).requestPermission === 'function') {
+        const res = await (DeviceMotionEvent as any).requestPermission();
+        if (res !== 'granted') { setError("Permission refusée."); return; }
       }
-      setError(null);
-      
-      await requestWakeLock();
 
-      const numericPK = parseFloat(startPK) || 0;
-      currentPKRef.current = numericPK;
+      setError(null);
+      await requestWakeLock();
+      
+      const p = parseFloat(startPK) || 0;
+      currentPKRef.current = p;
       lastTimestampRef.current = 0;
-      setAnalysis(null);
       dataRef.current = [];
       setData([]);
-      setSelectedSession(null);
-      setStats({ 
-        startPK: numericPK, direction, track, thresholdLA: la, thresholdLI: li, thresholdLAI: lai,
+      setSyncPKValue('');
+      
+      setStats({
+        startPK: p, direction, track, thresholdLA: la, thresholdLI: li, thresholdLAI: lai,
         operator, line, train, engineNumber, position, note,
-        maxVertical: 0, maxTransversal: 0, avgMagnitude: 0, duration: 0, countLA: 0, countLI: 0, countLAI: 0 
+        maxVertical: 0, maxTransversal: 0, avgMagnitude: 0, duration: 0, countLA: 0, countLI: 0, countLAI: 0,
+        startTime: Date.now()
       });
+      
+      window.addEventListener('devicemotion', handleMotion);
       setIsMeasuring(true);
-      playStartSound();
+      if (audioSettings.sessionEvents) playTone(440, 0.2);
     } else {
+      window.removeEventListener('devicemotion', handleMotion);
       setIsMeasuring(false);
       await releaseWakeLock();
+      if (audioSettings.sessionEvents) playTone(220, 0.3);
 
-      playStopSound();
-      const finalStats = { 
-        ...stats, 
-        startPK: parseFloat(startPK) || 0,
-        operator, line, train, engineNumber, position, note
-      };
-      const newRecord: SessionRecord = {
+      const record: SessionRecord = {
         id: `sess_${Date.now()}`,
         date: new Date().toLocaleString('fr-FR'),
-        stats: finalStats,
+        stats: { ...stats },
         data: [...dataRef.current],
-        analysis: analysis
+        analysis: null
       };
-      const updatedHistory = [newRecord, ...history].slice(0, 10);
-      setHistory(updatedHistory);
-      localStorage.setItem('gforce_history_v4', JSON.stringify(updatedHistory));
-      setSelectedSession(newRecord);
+      const newHistory = [record, ...history].slice(0, 20);
+      setHistory(newHistory);
+      localStorage.setItem('atc_history_v2', JSON.stringify(newHistory));
+      setSelectedSession(record);
     }
   };
 
-  const handleAnalyze = async () => {
-    const sourceData = selectedSession ? selectedSession.data : dataRef.current;
-    const sourceStats = selectedSession ? selectedSession.stats : stats;
-    
-    if (sourceData.length < 10) {
-      setError("Pas assez de données pour l'analyse (minimum 10 points).");
-      return;
+  const handleSyncPK = () => {
+    const newVal = parseFloat(syncPKValue);
+    if (!isNaN(newVal)) {
+      currentPKRef.current = newVal;
+      setSyncPKValue('');
+      if (audioSettings.sessionEvents) playTone(880, 0.1);
     }
+  };
 
+  const handleCSVImport = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result as string;
+      const rows = text.split('\n').filter(r => r.trim() !== '');
+      if (rows.length < 2) return;
+
+      const header = rows[0].toLowerCase();
+      const colIdx = {
+        pk: header.includes('pk') ? rows[0].split(',').findIndex(c => c.toLowerCase().includes('pk')) : -1,
+        y: header.includes('y') || header.includes('atc') ? rows[0].split(',').findIndex(c => c.toLowerCase().includes('y') || c.toLowerCase().includes('atc')) : -1,
+        z: header.includes('z') || header.includes('avc') ? rows[0].split(',').findIndex(c => c.toLowerCase().includes('z') || c.toLowerCase().includes('avc')) : -1
+      };
+
+      const importedData: AccelerationData[] = rows.slice(1).map((row, i) => {
+        const cells = row.split(',');
+        return {
+          timestamp: Date.now() + i * 20, // Assumé 50Hz si pas de timestamp
+          x: 0,
+          y: parseFloat(cells[colIdx.y]) || 0,
+          z: parseFloat(cells[colIdx.z]) || 0,
+          magnitude: 0,
+          pk: parseFloat(cells[colIdx.pk]) || 0
+        };
+      });
+
+      const maxZ = Math.max(...importedData.map(d => Math.abs(d.z)));
+      const maxY = Math.max(...importedData.map(d => Math.abs(d.y)));
+
+      const importedStats: SessionStats = {
+        startPK: importedData[0].pk || 0,
+        direction: 'croissant',
+        track: 'LGV1',
+        thresholdLA: 1.2, thresholdLI: 2.2, thresholdLAI: 2.8,
+        operator: 'IMPORT',
+        line: 'IMPORT_CSV',
+        train: 'EXTERNE',
+        engineNumber: 'N/A',
+        position: 'N/A',
+        note: `Fichier: ${file.name}`,
+        maxVertical: maxZ,
+        maxTransversal: maxY,
+        avgMagnitude: 0,
+        duration: importedData.length * 0.02,
+        countLA: 0, countLI: 0, countLAI: 0,
+        startTime: Date.now()
+      };
+
+      const record: SessionRecord = {
+        id: `import_${Date.now()}`,
+        date: new Date().toLocaleString('fr-FR'),
+        stats: importedStats,
+        data: importedData,
+        analysis: null
+      };
+
+      setHistory(prev => [record, ...prev].slice(0, 20));
+      setSelectedSession(record);
+    };
+    reader.readAsText(file);
+  };
+
+  const handleIAAnalysis = async () => {
+    const s = selectedSession;
+    if (!s || s.data.length < 10) return;
     setIsAnalyzing(true);
-    setError(null);
     try {
-      const result = await analyzeMotionSession(sourceData, sourceStats);
-      if (selectedSession) {
-        const updated = history.map(h => h.id === selectedSession.id ? { ...h, analysis: result } : h);
-        setHistory(updated);
-        localStorage.setItem('gforce_history_v4', JSON.stringify(updated));
-        setSelectedSession({ ...selectedSession, analysis: result });
-      } else {
-        setAnalysis(result);
-      }
-    } catch (err: any) {
-      console.error(err);
-      setError(`Analyse échouée: ${err.message || "Erreur serveur IA"}`);
+      const result = await analyzeMotionSession(s.data, s.stats);
+      const updated = history.map(h => h.id === s.id ? { ...h, analysis: result } : h);
+      setHistory(updated);
+      setSelectedSession({ ...s, analysis: result });
+      localStorage.setItem('atc_history_v2', JSON.stringify(updated));
+    } catch (e: any) {
+      setError(e.message);
     } finally {
       setIsAnalyzing(false);
     }
   };
 
-  const handlePDFExportClick = () => {
-    const targetData = selectedSession ? selectedSession.data : dataRef.current;
-    if (targetData.length > 0) {
-      const pks = targetData.map(d => d.pk || 0);
-      setExportPKStart(Math.min(...pks).toFixed(3));
-      setExportPKEnd(Math.max(...pks).toFixed(3));
-      setIsPDFModalOpen(true);
-    }
-  };
-
-  const executePDFExport = async () => {
-    if (!chartContainerRef.current) return;
-    const targetData = selectedSession ? selectedSession.data : dataRef.current;
-    const pStart = parseFloat(exportPKStart);
-    const pEnd = parseFloat(exportPKEnd);
-    
-    const filteredData = targetData.filter(d => {
-      const pk = d.pk || 0;
-      return pk >= Math.min(pStart, pEnd) && pk <= Math.max(pStart, pEnd);
-    });
-
-    setIsPDFModalOpen(false);
-    
-    const exportDiv = document.createElement('div');
-    exportDiv.style.position = 'absolute';
-    exportDiv.style.left = '-9999px';
-    exportDiv.style.width = '1000px';
-    exportDiv.style.backgroundColor = 'white';
-    exportDiv.style.padding = '40px';
-    document.body.appendChild(exportDiv);
-
-    const generateChartImage = async (dataKey: 'z' | 'y', label: string, stroke: string, thresholds?: any) => {
-      const container = document.createElement('div');
-      container.style.width = '900px';
-      container.style.height = '400px';
-      container.style.marginBottom = '20px';
-      exportDiv.appendChild(container);
-
-      const root = (await import('react-dom/client')).createRoot(container);
-      
-      return new Promise<string>((resolve) => {
-        root.render(
-          <div style={{ background: 'white', color: 'black' }}>
-            <MotionChart 
-              data={filteredData} 
-              dataKey={dataKey} 
-              name={label} 
-              stroke={stroke} 
-              thresholds={thresholds}
-            />
-          </div>
-        );
-        setTimeout(async () => {
-          const canvas = await html2canvas(container, { scale: 2, backgroundColor: 'white' });
-          resolve(canvas.toDataURL('image/png'));
-          exportDiv.removeChild(container);
-        }, 1000);
-      });
-    };
-
-    const imgATC = await generateChartImage('z', 'ATC (m/s²)', '#3b82f6', { la, li, lai });
-    const imgAVC = await generateChartImage('y', 'AVC (m/s²)', '#f43f5e');
-
-    const doc = new jsPDF('p', 'mm', 'a4');
-    const s = selectedSession ? selectedSession.stats : stats;
-    const dateFull = selectedSession ? selectedSession.date : new Date().toLocaleString('fr-FR');
-    const [dPart, tPart] = dateFull.split(' ');
-
-    doc.setFontSize(28);
-    doc.setFont("helvetica", "bold");
-    doc.setTextColor(30, 58, 138); 
-    doc.text("ATC", 140, 20);
-    doc.setTextColor(59, 130, 246); 
-    doc.text("LACHGUER", 154, 20);
-    doc.setDrawColor(30, 58, 138);
-    doc.setLineWidth(0.8);
-    doc.line(140, 22, 195, 22);
-    doc.setFontSize(8);
-    doc.setFont("helvetica", "italic");
-    doc.setTextColor(100, 100, 100);
-    doc.text("Expertise & Mesures Ferroviaires", 150, 26);
-
-    doc.setFontSize(14);
-    doc.setTextColor(0, 0, 0);
-    doc.setFont("helvetica", "bold");
-    const reportId = `${dPart.replace(/\//g, '')}_${tPart.replace(/:/g, '')}_${s.track}`;
-    doc.text(`RAPPORT TECHNIQUE D'INSPECTION`, 20, 20);
-
-    doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
-    let yPos = 35;
-    const lineSpacing = 6;
-    doc.text(`Date : ${dPart}, Heure : ${tPart}, Opérateur : ${s.operator}`, 20, yPos); yPos += lineSpacing;
-    doc.text(`Secteur : LGV, Ligne : ${s.line}`, 20, yPos); yPos += lineSpacing;
-    doc.text(`Voie : ${s.track}, PK : ${pStart.toFixed(5)} à ${pEnd.toFixed(5)}`, 20, yPos); yPos += lineSpacing;
-    doc.text(`Train : ${s.train}, N° motrice : ${s.engineNumber}, Position : ${s.position}`, 20, yPos); yPos += lineSpacing;
-    doc.text(`Note : ${s.note || 'RAS'}`, 20, yPos); yPos += lineSpacing;
-    doc.text(`Seuils ATC S1 / S2 / S3 : ${la.toFixed(1)} / ${li.toFixed(1)} / ${lai.toFixed(1)} m/s²`, 20, yPos); yPos += lineSpacing;
-    doc.text(`Seuils AVC S1 / S2 / S3 : 0,0 / 0,0 / 0,0 m/s²`, 20, yPos);
-
-    doc.addImage(imgATC, 'PNG', 15, 80, 180, 80);
-    doc.addImage(imgAVC, 'PNG', 15, 170, 180, 80);
-
-    doc.setFontSize(14);
-    doc.setFont("helvetica", "bold");
-    doc.setTextColor(30, 58, 138);
-    doc.text("ATC LACHGUER", 20, 285);
-    doc.setFontSize(10);
-    doc.setTextColor(0, 0, 0);
-    doc.text("Page 1 / 1", 100, 285);
-
-    doc.save(`Rapport_ATC_${reportId}.pdf`);
-    document.body.removeChild(exportDiv);
-  };
-
-  const deleteSession = (id: string) => {
-    const updated = history.filter(h => h.id !== id);
-    setHistory(updated);
-    localStorage.setItem('gforce_history_v4', JSON.stringify(updated));
-    if (selectedSession?.id === id) setSelectedSession(null);
-  };
-
   return (
-    <div className="min-h-screen bg-[#0f172a] text-slate-200 pb-20 font-sans selection:bg-blue-500/30">
-      {/* Header Bar */}
-      <header className="sticky top-0 z-40 bg-[#0f172a]/80 backdrop-blur-md border-b border-slate-800 px-4 py-3 flex justify-between items-center">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-gradient-to-br from-blue-600 to-indigo-700 rounded-xl flex items-center justify-center shadow-lg shadow-blue-900/20">
-            <i className="fas fa-train-subway text-white"></i>
+    <div className="min-h-screen bg-[#020617] text-slate-100 font-sans antialiased overflow-x-hidden pb-24">
+      {/* HUD - Header Status Bar */}
+      <nav className="sticky top-0 z-50 bg-[#0f172a]/80 backdrop-blur-xl border-b border-slate-800/60 px-6 py-4 flex justify-between items-center shadow-2xl">
+        <div className="flex items-center gap-4">
+          <div className="flex flex-col">
+            <h1 className="text-xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-600">
+              ATC MONITOR PRO
+            </h1>
+            <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">Inspection Unit</span>
           </div>
-          <div>
-            <h1 className="text-lg font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">G-Force Monitor Pro</h1>
-            <div className="flex items-center gap-2">
-              <p className="text-[10px] text-slate-500 font-mono tracking-tighter uppercase">ATC LACHGUER - Analysis</p>
-              {isWakeLocked && (
-                <span className="text-[9px] bg-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded flex items-center gap-1 font-bold">
-                  <i className="fas fa-lock"></i> ÉCRAN ACTIF
-                </span>
-              )}
+          {isMeasuring && (
+            <div className="flex items-center gap-2 bg-red-500/10 px-2 py-0.5 rounded-full border border-red-500/30">
+              <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
+              <span className="text-[10px] font-black text-red-500 uppercase">REC</span>
             </div>
-          </div>
+          )}
         </div>
-        <div className="flex gap-2">
+        
+        <div className="flex items-center gap-3">
           {gpsAccuracy !== null && (
-            <div className={`px-2 py-1 rounded text-[10px] font-bold border ${gpsAccuracy < 10 ? 'bg-green-500/10 border-green-500/50 text-green-400' : 'bg-orange-500/10 border-orange-500/50 text-orange-400'}`}>
-              GPS: {gpsAccuracy.toFixed(1)}m
+            <div className="hidden sm:flex flex-col items-end">
+              <span className="text-[9px] text-slate-500 font-bold uppercase">GPS Accuracy</span>
+              <span className={`text-[10px] font-mono ${gpsAccuracy < 10 ? 'text-emerald-400' : 'text-orange-400'}`}>
+                ±{gpsAccuracy.toFixed(1)}m
+              </span>
             </div>
           )}
           <button 
             onClick={toggleMeasurement}
-            className={`px-4 py-2 rounded-xl text-sm font-bold transition-all flex items-center gap-2 ${
+            className={`px-6 py-3 rounded-2xl font-black text-xs transition-all flex items-center gap-2 transform active:scale-95 ${
               isMeasuring 
-                ? 'bg-red-500 hover:bg-red-600 shadow-lg shadow-red-900/40 animate-pulse' 
-                : 'bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-900/40'
+                ? 'bg-red-600 shadow-lg shadow-red-900/40' 
+                : 'bg-indigo-600 shadow-lg shadow-indigo-900/40 hover:bg-indigo-500'
             }`}
           >
-            <i className={`fas ${isMeasuring ? 'fa-stop-circle' : 'fa-play-circle'}`}></i>
-            {isMeasuring ? 'STOP' : 'DÉMARRER'}
+            <i className={`fas ${isMeasuring ? 'fa-stop-circle' : 'fa-play'}`}></i>
+            {isMeasuring ? 'STOP SESSION' : 'START INSPECTION'}
           </button>
         </div>
-      </header>
+      </nav>
 
-      <main className="max-w-4xl mx-auto p-4 space-y-6">
+      <main className="max-w-6xl mx-auto px-6 pt-8 space-y-8">
         {error && (
-          <div className="bg-red-500/10 border border-red-500/50 p-4 rounded-xl flex items-center gap-3 text-red-400 text-sm animate-in fade-in duration-300">
-            <i className="fas fa-exclamation-triangle"></i>
-            <div className="flex-1">
-              <span className="font-bold">Erreur : </span>
-              {error}
-            </div>
+          <div className="bg-red-500/10 border border-red-500/40 p-4 rounded-2xl flex items-center gap-3 text-red-400 text-xs font-bold animate-in fade-in zoom-in duration-300">
+            <i className="fas fa-triangle-exclamation text-lg"></i>
+            {error}
           </div>
         )}
 
-        {/* Configuration Panel */}
-        {!isMeasuring && !selectedSession && (
-          <div className="space-y-6">
-            <div className="glass-card p-6 rounded-2xl border border-slate-800">
-              <h2 className="text-sm font-black text-slate-500 uppercase tracking-widest mb-6 flex items-center gap-2">
-                <i className="fas fa-sliders text-blue-500"></i> Configuration Inspection
-              </h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div className="space-y-4">
-                  <div className="group">
-                    <label className="text-[10px] text-slate-500 font-bold uppercase mb-1 block ml-1">Point Kilométrique (PK)</label>
-                    <input 
-                      type="number" step="0.001" value={startPK} onChange={(e) => setStartPK(e.target.value)}
-                      placeholder="Ex: 175.100"
-                      className="w-full bg-slate-900/50 border border-slate-700 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all text-blue-400 font-mono"
-                    />
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="text-[10px] text-slate-500 font-bold uppercase mb-1 block ml-1">Sens PK</label>
-                      <select value={direction} onChange={(e) => setDirection(e.target.value as PKDirection)}
-                        className="w-full bg-slate-900/50 border border-slate-700 rounded-xl px-3 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500/50">
-                        <option value="croissant">Croissant</option>
-                        <option value="decroissant">Décroissant</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="text-[10px] text-slate-500 font-bold uppercase mb-1 block ml-1">Voie</label>
-                      <select value={track} onChange={(e) => setTrack(e.target.value as TrackType)}
-                        className="w-full bg-slate-900/50 border border-slate-700 rounded-xl px-3 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500/50">
-                        <option value="">Sélectionner...</option>
-                        <option value="LGV1">LGV 1</option>
-                        <option value="LGV2">LGV 2</option>
-                      </select>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2">
-                    <div>
-                      <label className="text-[9px] text-slate-500 font-bold uppercase mb-1 block">Alerte (LA)</label>
-                      <input type="number" step="0.1" value={la} onChange={(e) => setLa(parseFloat(e.target.value))}
-                        className="w-full bg-slate-900/50 border border-slate-700 rounded-lg px-2 py-2 text-center text-xs" />
-                    </div>
-                    <div>
-                      <label className="text-[9px] text-slate-500 font-bold uppercase mb-1 block">Interv (LI)</label>
-                      <input type="number" step="0.1" value={li} onChange={(e) => setLi(parseFloat(e.target.value))}
-                        className="w-full bg-slate-900/50 border border-slate-700 rounded-lg px-2 py-2 text-center text-xs" />
-                    </div>
-                    <div>
-                      <label className="text-[9px] text-slate-500 font-bold uppercase mb-1 block">Immed (LAI)</label>
-                      <input type="number" step="0.1" value={lai} onChange={(e) => setLai(parseFloat(e.target.value))}
-                        className="w-full bg-slate-900/50 border border-slate-700 rounded-lg px-2 py-2 text-center text-xs" />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="space-y-4">
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="text-[10px] text-slate-500 font-bold uppercase mb-1 block">Opérateur</label>
-                      <input value={operator} onChange={(e) => setOperator(e.target.value)} className="w-full bg-slate-900/50 border border-slate-700 rounded-xl px-3 py-3 text-sm" />
-                    </div>
-                    <div>
-                      <label className="text-[10px] text-slate-500 font-bold uppercase mb-1 block">Train</label>
-                      <input value={train} onChange={(e) => setTrain(e.target.value)} className="w-full bg-slate-900/50 border border-slate-700 rounded-xl px-3 py-3 text-sm" />
-                    </div>
-                  </div>
-                  <div>
-                    <label className="text-[10px] text-slate-500 font-bold uppercase mb-1 block">N° Motrice</label>
-                    <input value={engineNumber} onChange={(e) => setEngineNumber(e.target.value)} className="w-full bg-slate-900/50 border border-slate-700 rounded-xl px-3 py-3 text-sm" />
-                  </div>
-                  <div>
-                    <label className="text-[10px] text-slate-500 font-bold uppercase mb-1 block">Position</label>
-                    <input value={position} onChange={(e) => setPosition(e.target.value)} className="w-full bg-slate-900/50 border border-slate-700 rounded-xl px-3 py-3 text-sm" />
-                  </div>
-                </div>
-              </div>
+        {(isMeasuring || selectedSession) ? (
+          <div className="space-y-8 animate-in slide-in-from-bottom-6 duration-700">
+            {/* Main Stats Grid */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-6">
+              <ValueDisplay label="Vitesse" value={speedKmh} unit="km/h" color="text-indigo-400" icon="fa-bolt" />
+              <ValueDisplay 
+                label="Point Kilo" 
+                value={selectedSession ? (selectedSession.data[selectedSession.data.length-1]?.pk || 0) : currentAccel.pk || 0} 
+                unit="pk" color="text-blue-400" icon="fa-map-pin" 
+              />
+              <ValueDisplay label="γz Max (AVC)" value={selectedSession ? selectedSession.stats.maxVertical : stats.maxVertical} unit="m/s²" color="text-emerald-400" icon="fa-arrows-up-down" />
+              <ValueDisplay label="Alertes ATC" value={selectedSession ? (selectedSession.stats.countLI + selectedSession.stats.countLAI) : (stats.countLI + stats.countLAI)} unit="pts" color="text-red-400" icon="fa-bolt-lightning" />
             </div>
 
-            {/* Audio & Settings Panel */}
-            <div className="glass-card p-6 rounded-2xl border border-slate-800">
-              <h2 className="text-sm font-black text-slate-500 uppercase tracking-widest mb-6 flex items-center gap-2">
-                <i className="fas fa-gears text-indigo-500"></i> Paramètres Système
-              </h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="flex items-center justify-between p-3 bg-slate-900/40 rounded-xl border border-slate-800/50">
-                   <div className="flex items-center gap-3">
-                     <i className={`fas fa-microphone ${audioSettings.enabled ? 'text-blue-500' : 'text-slate-600'}`}></i>
-                     <span className="text-sm font-bold">Alertes Audio</span>
-                   </div>
-                   <button 
-                     onClick={() => setAudioSettings(p => ({...p, enabled: !p.enabled}))}
-                     className={`w-12 h-6 rounded-full transition-all relative ${audioSettings.enabled ? 'bg-blue-600' : 'bg-slate-700'}`}
-                   >
-                     <div className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${audioSettings.enabled ? 'right-1' : 'left-1'}`}></div>
-                   </button>
+            {/* Recalage PK en direct */}
+            {isMeasuring && (
+              <div className="glass-card p-6 rounded-3xl border-indigo-500/20 flex flex-col md:flex-row items-center gap-6 shadow-xl">
+                <div className="flex-1 space-y-1">
+                  <h3 className="text-xs font-black text-indigo-400 uppercase tracking-widest">Recalage PK Terrain</h3>
+                  <p className="text-[10px] text-slate-500 font-medium">Saisissez le PK exact lu sur le terrain pour corriger le décalage.</p>
                 </div>
-                
-                <div className="flex items-center justify-between p-3 bg-slate-900/40 rounded-xl border border-slate-800/50">
-                   <div className="flex items-center gap-3">
-                     <i className={`fas fa-sun ${isWakeLocked ? 'text-yellow-500' : 'text-slate-600'}`}></i>
-                     <span className="text-sm font-bold">Anti-Veille Auto</span>
-                   </div>
-                   <div className="text-[10px] font-bold text-slate-500 uppercase">DÉMARRE AVEC MESURE</div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Dashboards */}
-        {(isMeasuring || selectedSession) && (
-          <div className="space-y-6">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <ValueDisplay label="Vitesse" value={speedMps * 3.6} unit="km/h" color="text-blue-400" icon="fa-gauge-high" />
-              <ValueDisplay label="PK Actuel" value={selectedSession ? (selectedSession.data[selectedSession.data.length-1]?.pk || 0) : currentAccel.pk || 0} unit="km" color="text-indigo-400" icon="fa-location-dot" />
-              <ValueDisplay label="Acc. Verticale" value={selectedSession ? selectedSession.stats.maxVertical : stats.maxVertical} unit="m/s²" color="text-emerald-400" icon="fa-arrows-up-down" />
-              <ValueDisplay label="Dépassements LI/LAI" value={selectedSession ? (selectedSession.stats.countLI + selectedSession.stats.countLAI) : (stats.countLI + stats.countLAI)} unit="pts" color="text-orange-400" icon="fa-triangle-exclamation" />
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6" ref={chartContainerRef}>
-              <MotionChart data={selectedSession ? selectedSession.data : data} dataKey="z" name="ATC (m/s²) - Verticale" stroke="#3b82f6" thresholds={{ la, li, lai }} />
-              <MotionChart data={selectedSession ? selectedSession.data : data} dataKey="y" name="AVC (m/s²) - Transversale" stroke="#f43f5e" />
-            </div>
-
-            <div className="flex flex-wrap gap-4 items-center justify-center pt-4">
-              <button 
-                onClick={handleAnalyze} 
-                disabled={isAnalyzing || (selectedSession ? selectedSession.data.length < 5 : data.length < 5)}
-                className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 transition-all shadow-xl shadow-indigo-900/20 min-w-[200px]"
-              >
-                {isAnalyzing ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-brain"></i>}
-                {isAnalyzing ? 'ANALYSE EN COURS...' : 'ANALYSER PAR IA'}
-              </button>
-              <button 
-                onClick={handlePDFExportClick}
-                className="bg-slate-700 hover:bg-slate-600 px-6 py-3 rounded-2xl font-bold flex items-center gap-2 transition-all shadow-xl shadow-slate-900/20"
-              >
-                <i className="fas fa-file-pdf"></i>
-                EXPORTER PDF
-              </button>
-            </div>
-
-            {(analysis || (selectedSession && selectedSession.analysis)) && (
-              <div className="glass-card p-6 rounded-3xl border border-blue-500/30 bg-blue-500/5 animate-in fade-in slide-in-from-bottom-4 duration-500">
-                <div className="flex justify-between items-start mb-4">
-                  <div className="flex items-center gap-3">
-                    <div className="w-12 h-12 bg-blue-500 rounded-2xl flex items-center justify-center text-2xl">
-                      <i className="fas fa-robot text-white"></i>
-                    </div>
-                    <div>
-                      <h3 className="font-bold text-lg text-white">Rapport d'Analyse IA</h3>
-                      <p className="text-xs text-blue-400 font-medium uppercase tracking-wider">Expertise Infrastructure</p>
-                    </div>
-                  </div>
-                  <div className={`px-4 py-1 rounded-full text-xs font-black uppercase tracking-widest ${
-                    (selectedSession?.analysis || analysis)?.complianceLevel === 'Conforme' ? 'bg-green-500/20 text-green-400' :
-                    (selectedSession?.analysis || analysis)?.complianceLevel === 'Surveillance' ? 'bg-orange-500/20 text-orange-400' : 'bg-red-500/20 text-red-400'
-                  }`}>
-                    {(selectedSession?.analysis || analysis)?.complianceLevel}
-                  </div>
-                </div>
-                
-                <div className="space-y-4">
-                  <div className="bg-slate-900/60 p-4 rounded-xl border border-slate-800">
-                    <h4 className="text-[10px] text-slate-500 font-bold uppercase mb-2">Observations</h4>
-                    <ul className="text-sm text-slate-300 list-disc ml-4 space-y-1">
-                      {(selectedSession?.analysis || analysis)?.observations.map((obs, idx) => (
-                        <li key={idx}>{obs}</li>
-                      ))}
-                    </ul>
-                  </div>
-                  <div className="bg-slate-900/60 p-4 rounded-xl border border-slate-800">
-                    <h4 className="text-[10px] text-slate-500 font-bold uppercase mb-2">Recommandations</h4>
-                    <p className="text-sm italic text-slate-300">
-                      "{(selectedSession?.analysis || analysis)?.recommendations}"
-                    </p>
-                  </div>
+                <div className="flex w-full md:w-auto gap-3">
+                  <input 
+                    type="number" step="0.001" 
+                    value={syncPKValue} 
+                    onChange={(e) => setSyncPKValue(e.target.value)}
+                    placeholder="PK Terrain (ex: 12.450)"
+                    className="flex-1 md:w-48 bg-slate-900 border border-slate-700 h-12 rounded-xl px-4 text-sm font-mono font-bold focus:ring-2 focus:ring-indigo-500/50 outline-none"
+                  />
+                  <button 
+                    onClick={handleSyncPK}
+                    className="bg-indigo-600 hover:bg-indigo-500 px-6 h-12 rounded-xl font-black text-xs uppercase tracking-widest transition-all active:scale-95 shadow-lg shadow-indigo-900/20"
+                  >
+                    Recaler
+                  </button>
                 </div>
               </div>
             )}
-          </div>
-        )}
 
-        {/* History Section */}
-        {!isMeasuring && !selectedSession && history.length > 0 && (
-          <div className="space-y-4">
-            <h2 className="text-sm font-black text-slate-500 uppercase tracking-widest flex items-center gap-2 px-2">
-              <i className="fas fa-history text-indigo-500"></i> Historique des Mesures
-            </h2>
-            <div className="grid grid-cols-1 gap-3">
-              {history.map(record => (
-                <div 
-                  key={record.id} 
-                  className="glass-card p-4 rounded-2xl border border-slate-800 flex justify-between items-center transition-all hover:border-slate-600 hover:bg-slate-800/40 cursor-pointer group"
-                  onClick={() => setSelectedSession(record)}
-                >
-                  <div className="flex items-center gap-4">
-                    <div className="w-12 h-12 bg-slate-800 rounded-xl flex flex-col items-center justify-center text-[10px] font-bold text-slate-400 group-hover:bg-blue-600 group-hover:text-white transition-colors">
-                      <span>{record.date.split(' ')[0].split('/')[0]}</span>
-                      <span className="uppercase">{record.date.split(' ')[0].split('/')[1]}</span>
+            {/* Charts Section */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              <MotionChart 
+                data={selectedSession ? selectedSession.data : data} 
+                dataKey="z" name="AVC (Nivellement)" 
+                stroke="#6366f1" 
+              />
+              <MotionChart 
+                data={selectedSession ? selectedSession.data : data} 
+                dataKey="y" name="ATC (Dressage)" 
+                stroke="#f43f5e" 
+                thresholds={{ la, li, lai }}
+              />
+            </div>
+
+            {/* AI Result Section */}
+            {selectedSession && !isMeasuring && (
+              <div className="space-y-6">
+                <div className="flex gap-4">
+                  <button 
+                    onClick={handleIAAnalysis} 
+                    disabled={isAnalyzing}
+                    className="flex-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 h-16 rounded-2xl font-black text-sm flex items-center justify-center gap-3 shadow-xl shadow-indigo-900/20 transition-all"
+                  >
+                    {isAnalyzing ? <i className="fas fa-circle-notch fa-spin"></i> : <i className="fas fa-brain"></i>}
+                    {isAnalyzing ? 'ANALYSE IA EN COURS...' : 'GÉNÉRER DIAGNOSTIC IA'}
+                  </button>
+                </div>
+
+                {selectedSession.analysis && (
+                  <div className="glass-card border-indigo-500/30 bg-indigo-500/5 p-8 rounded-3xl animate-in fade-in slide-in-from-top-4 duration-500">
+                    <div className="flex flex-col md:flex-row justify-between gap-6 mb-8">
+                      <div className="flex items-center gap-4">
+                        <div className="w-14 h-14 bg-indigo-600 rounded-2xl flex items-center justify-center text-2xl shadow-lg">
+                          <i className="fas fa-robot text-white"></i>
+                        </div>
+                        <div>
+                          <h3 className="font-black text-xl text-white tracking-tight">Expertise Infrastructure</h3>
+                          <p className="text-xs text-indigo-400 font-bold uppercase tracking-widest">{selectedSession.analysis.activityType}</p>
+                        </div>
+                      </div>
+                      <div className={`self-start px-6 py-2 rounded-xl text-xs font-black uppercase tracking-widest shadow-lg ${
+                        selectedSession.analysis.complianceLevel === 'Conforme' ? 'bg-emerald-500 text-white' :
+                        selectedSession.analysis.complianceLevel === 'Surveillance' ? 'bg-orange-500 text-white' : 'bg-red-500 text-white'
+                      }`}>
+                        Statut: {selectedSession.analysis.complianceLevel}
+                      </div>
                     </div>
-                    <div>
-                      <div className="font-bold text-slate-200">Session {record.stats.track} - {record.stats.line}</div>
-                      <div className="text-[10px] text-slate-500 flex gap-3 font-mono">
-                        <span>PK: {record.stats.startPK.toFixed(3)}</span>
-                        <span>DUR: {record.stats.duration.toFixed(0)}s</span>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                      <div className="space-y-4">
+                        <h4 className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2">
+                          <i className="fas fa-eye text-indigo-500"></i> Observations Techniques
+                        </h4>
+                        <ul className="space-y-3">
+                          {selectedSession.analysis.observations.map((obs, idx) => (
+                            <li key={idx} className="bg-slate-900/50 p-4 rounded-xl border border-slate-800/50 text-sm text-slate-300 leading-relaxed">
+                              {obs}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                      <div className="space-y-6">
+                         <div>
+                            <h4 className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2 mb-4">
+                              <i className="fas fa-map-location-dot text-indigo-500"></i> Points Critiques (PK)
+                            </h4>
+                            <div className="flex flex-wrap gap-2">
+                              {selectedSession.analysis.anomalousPKs.map((pk, idx) => (
+                                <span key={idx} className="bg-red-500/10 text-red-400 border border-red-500/30 px-3 py-1.5 rounded-lg text-xs font-mono font-bold">
+                                  PK {pk}
+                                </span>
+                              ))}
+                            </div>
+                         </div>
+                         <div>
+                            <h4 className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2 mb-4">
+                              <i className="fas fa-wrench text-indigo-500"></i> Recommandations
+                            </h4>
+                            <p className="bg-indigo-500/10 border border-indigo-500/20 p-5 rounded-2xl text-sm italic text-indigo-200 leading-relaxed">
+                              "{selectedSession.analysis.recommendations}"
+                            </p>
+                         </div>
                       </div>
                     </div>
                   </div>
-                  <button 
-                    onClick={(e) => { e.stopPropagation(); deleteSession(record.id); }}
-                    className="w-8 h-8 rounded-lg bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white transition-all flex items-center justify-center"
-                  >
-                    <i className="fas fa-trash-can text-xs"></i>
-                  </button>
-                </div>
-              ))}
-            </div>
+                )}
+                
+                <button 
+                  onClick={() => setSelectedSession(null)}
+                  className="w-full h-14 bg-slate-800 border border-slate-700/50 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-slate-700 transition-all active:scale-95"
+                >
+                  <i className="fas fa-chevron-left mr-2"></i> Retour Historique
+                </button>
+              </div>
+            )}
           </div>
-        )}
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 animate-in fade-in duration-500">
+            {/* Session Configuration Card */}
+            <section className="lg:col-span-2 space-y-8">
+              <div className="glass-card p-8 rounded-[2rem] border-slate-800/50">
+                <h2 className="text-sm font-black text-slate-500 uppercase tracking-[0.3em] mb-8 flex items-center gap-3">
+                  <div className="w-1 h-4 bg-indigo-500 rounded-full"></div>
+                  Mission Configuration
+                </h2>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                  <div className="space-y-6">
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Initial PK</label>
+                      <input 
+                        type="number" step="0.001" value={startPK} onChange={(e) => setStartPK(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-700 h-14 rounded-2xl px-5 text-indigo-400 font-mono text-lg focus:ring-2 focus:ring-indigo-500/50 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Direction</label>
+                        <select value={direction} onChange={(e) => setDirection(e.target.value as PKDirection)}
+                          className="w-full bg-slate-900 border border-slate-700 h-14 rounded-2xl px-4 text-sm font-bold appearance-none cursor-pointer">
+                          <option value="croissant">Croissant</option>
+                          <option value="decroissant">Décroissant</option>
+                        </select>
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Track</label>
+                        <select value={track} onChange={(e) => setTrack(e.target.value as TrackType)}
+                          className="w-full bg-slate-900 border border-slate-700 h-14 rounded-2xl px-4 text-sm font-bold">
+                          <option value="LGV1">LGV 1</option>
+                          <option value="LGV2">LGV 2</option>
+                          <option value="V1">V1</option>
+                          <option value="V2">V2</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
 
-        {selectedSession && !isMeasuring && (
-          <button 
-            onClick={() => setSelectedSession(null)}
-            className="w-full mt-4 bg-slate-800 border border-slate-700 p-4 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-slate-700 transition-all"
-          >
-            <i className="fas fa-arrow-left"></i> RETOUR À L'ACCUEIL
-          </button>
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Operator ID</label>
+                        <input value={operator} onChange={(e) => setOperator(e.target.value)} className="w-full bg-slate-900 border border-slate-700 h-14 rounded-2xl px-5 text-sm font-bold" />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Train</label>
+                        <input value={train} onChange={(e) => setTrain(e.target.value)} className="w-full bg-slate-900 border border-slate-700 h-14 rounded-2xl px-5 text-sm font-bold" />
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-slate-500 uppercase ml-1">Engine / Car Number</label>
+                      <input value={engineNumber} onChange={(e) => setEngineNumber(e.target.value)} className="w-full bg-slate-900 border border-slate-700 h-14 rounded-2xl px-5 text-sm font-bold" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-10 pt-8 border-t border-slate-800/50">
+                  <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6">Seuils ATC (Dressage γ en m/s²)</h3>
+                  <div className="grid grid-cols-3 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-[9px] font-black text-yellow-500/80 uppercase">Warning (LA)</label>
+                      <input type="number" step="0.1" value={la} onChange={(e) => setLa(parseFloat(e.target.value))} className="w-full bg-slate-900 border border-slate-800 h-12 rounded-xl text-center font-mono font-bold" />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[9px] font-black text-orange-500/80 uppercase">Intervention (LI)</label>
+                      <input type="number" step="0.1" value={li} onChange={(e) => setLi(parseFloat(e.target.value))} className="w-full bg-slate-900 border border-slate-800 h-12 rounded-xl text-center font-mono font-bold" />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[9px] font-black text-red-500/80 uppercase">Immediate (LAI)</label>
+                      <input type="number" step="0.1" value={lai} onChange={(e) => setLai(parseFloat(e.target.value))} className="w-full bg-slate-900 border border-slate-800 h-12 rounded-xl text-center font-mono font-bold" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Quick Settings */}
+              <div className="glass-card p-6 rounded-3xl border-slate-800/40 flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${audioSettings.enabled ? 'bg-indigo-500/20 text-indigo-400' : 'bg-slate-800 text-slate-500'}`}>
+                    <i className="fas fa-volume-high"></i>
+                  </div>
+                  <span className="text-xs font-black uppercase tracking-widest">Feedback Audio (ATC)</span>
+                </div>
+                <button 
+                  onClick={() => setAudioSettings(p => ({ ...p, enabled: !p.enabled }))}
+                  className={`w-14 h-8 rounded-full p-1 transition-all ${audioSettings.enabled ? 'bg-indigo-600' : 'bg-slate-700'}`}
+                >
+                  <div className={`w-6 h-6 bg-white rounded-full shadow-lg transform transition-transform ${audioSettings.enabled ? 'translate-x-6' : 'translate-x-0'}`}></div>
+                </button>
+              </div>
+            </section>
+
+            {/* History Sidebar */}
+            <aside className="space-y-6">
+              <div className="flex justify-between items-center px-2">
+                <h2 className="text-sm font-black text-slate-500 uppercase tracking-widest flex items-center gap-3">
+                  <i className="fas fa-clock-rotate-left text-indigo-500"></i>
+                  Recent Records
+                </h2>
+                <button 
+                  onClick={() => fileInputRef.current?.click()}
+                  className="w-10 h-10 bg-indigo-600/20 text-indigo-400 border border-indigo-500/30 rounded-xl hover:bg-indigo-600 hover:text-white transition-all shadow-lg flex items-center justify-center"
+                  title="Importer un fichier CSV"
+                >
+                  <i className="fas fa-file-import text-sm"></i>
+                </button>
+                <input 
+                  type="file" 
+                  ref={fileInputRef} 
+                  onChange={handleCSVImport} 
+                  accept=".csv" 
+                  className="hidden" 
+                />
+              </div>
+
+              <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+                {history.length === 0 ? (
+                  <div className="glass-card p-8 rounded-3xl text-center border-dashed border-slate-800">
+                    <i className="fas fa-folder-open text-slate-700 text-3xl mb-4"></i>
+                    <p className="text-xs text-slate-500 font-bold uppercase tracking-widest">No records found</p>
+                    <p className="text-[10px] text-slate-600 mt-2">Mesurez en direct ou importez un CSV.</p>
+                  </div>
+                ) : (
+                  history.map(record => (
+                    <div 
+                      key={record.id}
+                      onClick={() => setSelectedSession(record)}
+                      className="glass-card p-5 rounded-2xl border-slate-800/40 hover:border-indigo-500/50 hover:bg-indigo-500/[0.02] transition-all cursor-pointer group"
+                    >
+                      <div className="flex justify-between items-start mb-3">
+                         <div className="flex gap-2">
+                            <span className="text-[10px] font-mono text-indigo-400 font-bold">{record.date.split(' ')[0]}</span>
+                            {record.id.startsWith('import') && (
+                              <span className="text-[8px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded border border-indigo-500/30 font-black uppercase">Import</span>
+                            )}
+                         </div>
+                         {record.analysis && <i className="fas fa-brain text-[10px] text-emerald-400"></i>}
+                      </div>
+                      <div className="font-bold text-sm mb-1 group-hover:text-indigo-300 transition-colors uppercase">
+                        {record.stats.operator === 'IMPORT' ? record.stats.note : `VOIE ${record.stats.track} — ${record.stats.line}`}
+                      </div>
+                      <div className="flex items-center gap-4 text-[9px] font-black text-slate-500 uppercase tracking-widest">
+                         <span>PK {record.stats.startPK.toFixed(3)}</span>
+                         <span>Max γz: {record.stats.maxVertical.toFixed(2)}</span>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </aside>
+          </div>
         )}
       </main>
 
-      {/* PDF Export Modal */}
-      {isPDFModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-300">
-          <div className="glass-card w-full max-w-md p-8 rounded-3xl border border-slate-700 shadow-2xl space-y-6">
-            <div className="text-center">
-              <div className="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4">
-                <i className="fas fa-file-export text-white"></i>
-              </div>
-              <h3 className="text-xl font-black">Exporter le Rapport PDF</h3>
-              <p className="text-sm text-slate-500 mt-2">Définissez la plage PK pour le rapport technique ATC LACHGUER.</p>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="text-[10px] text-slate-500 font-black uppercase mb-1 block">PK DÉBUT</label>
-                <input 
-                  type="number" step="0.001" value={exportPKStart} onChange={(e) => setExportPKStart(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-blue-400 font-mono"
-                />
-              </div>
-              <div>
-                <label className="text-[10px] text-slate-500 font-black uppercase mb-1 block">PK FIN</label>
-                <input 
-                  type="number" step="0.001" value={exportPKEnd} onChange={(e) => setExportPKEnd(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-blue-400 font-mono"
-                />
-              </div>
-            </div>
-            <div className="flex gap-3">
-              <button onClick={() => setIsPDFModalOpen(false)} className="flex-1 bg-slate-800 py-4 rounded-2xl font-bold hover:bg-slate-700 transition-all">ANNULER</button>
-              <button onClick={executePDFExport} className="flex-2 bg-blue-600 py-4 px-8 rounded-2xl font-bold hover:bg-blue-700 shadow-xl shadow-blue-900/40 transition-all">GÉNÉRER LE PDF</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Footer ATC LACHGUER */}
-      <footer className="fixed bottom-0 left-0 right-0 h-16 bg-[#0f172a] border-t border-slate-800 flex items-center justify-around px-6 z-30">
-        <button className="text-blue-500 flex flex-col items-center gap-1">
-          <i className="fas fa-gauge-simple-high"></i>
-          <span className="text-[9px] font-bold uppercase">Monitor</span>
+      <footer className="fixed bottom-0 left-0 right-0 h-20 bg-slate-950/80 backdrop-blur-xl border-t border-slate-800/60 flex items-center justify-around px-8 z-40">
+        <button className="flex flex-col items-center gap-1.5 text-indigo-500 transition-transform active:scale-90" onClick={() => setSelectedSession(null)}>
+          <i className="fas fa-compass text-lg"></i>
+          <span className="text-[8px] font-black uppercase tracking-widest">Dashboard</span>
         </button>
-        <button className="text-slate-500 flex flex-col items-center gap-1" onClick={() => setSelectedSession(null)}>
-          <i className="fas fa-list-check"></i>
-          <span className="text-[9px] font-bold uppercase">Historique</span>
+        <button className="flex flex-col items-center gap-1.5 text-slate-500 hover:text-indigo-400 transition-all">
+          <i className="fas fa-gear text-lg"></i>
+          <span className="text-[8px] font-black uppercase tracking-widest">Settings</span>
         </button>
-        <div className="flex flex-col items-center opacity-40">
-           <span className="text-[8px] font-black text-blue-400">ATC LACHGUER</span>
-           <span className="text-[6px] font-mono">v2.2.0</span>
+        <div className="flex flex-col items-center gap-1.5 opacity-30">
+          <span className="text-[10px] font-black text-white tracking-tighter">ATC LACHGUER</span>
+          <span className="text-[7px] font-mono">2.2.0-PRO</span>
         </div>
       </footer>
+
+      <style>{`
+        .glass-card {
+          background: rgba(15, 23, 42, 0.4);
+          backdrop-filter: blur(16px);
+          border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: rgba(0, 0, 0, 0);
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: rgba(71, 85, 105, 0.3);
+          border-radius: 10px;
+        }
+      `}</style>
     </div>
   );
 };

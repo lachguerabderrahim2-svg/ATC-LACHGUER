@@ -1,9 +1,7 @@
 {
-  "name": "ATC.LACHGUER 2.0",
-  "description": "Une application avancée de mesure des accélérations verticales et transversales en temps réel avec analyse par IA et suivi PK par GPS.",
+  "name": "ATC LACHGUER Pro",
+  "description": "Station de mesure de géométrie de voie par accélérométrie. Analyse IA spécialisée pour la maintenance des infrastructures ferroviaires haute performance.",
   "requestFramePermissions": [
-    "camera",
-    "microphone",
     "geolocation"
   ]
 }

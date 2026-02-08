@@ -1,15 +1,15 @@
 
 export interface AccelerationData {
   timestamp: number;
-  x: number; // Transversal (Lateral)
-  y: number; // Transversal (Longitudinal)
+  x: number; // Transversal (Latéral)
+  y: number; // Longitudinal
   z: number; // Vertical
   magnitude: number;
   pk?: number; // Point Kilométrique au moment de la mesure
 }
 
 export type PKDirection = 'croissant' | 'decroissant';
-export type TrackType = 'LGV1' | 'LGV2' | '';
+export type TrackType = 'LGV1' | 'LGV2' | 'V1' | 'V2' | '';
 
 export interface AudioSettings {
   enabled: boolean;
@@ -23,10 +23,10 @@ export interface SessionConfig {
   startPK: number;
   direction: PKDirection;
   track: TrackType;
-  thresholdLA: number; // Alerte (S1)
-  thresholdLI: number; // Intervention (S2)
-  thresholdLAI: number; // Action Immédiate (S3)
-  // Métadonnées pour le rapport
+  thresholdLA: number; // Alerte (S1) - 1.2 m/s² par défaut
+  thresholdLI: number; // Intervention (S2) - 2.2 m/s² par défaut
+  thresholdLAI: number; // Action Immédiate (S3) - 2.8 m/s² par défaut
+  // Métadonnées
   operator: string;
   line: string;
   train: string;
@@ -43,6 +43,7 @@ export interface SessionStats extends SessionConfig {
   countLA: number;
   countLI: number;
   countLAI: number;
+  startTime: number;
 }
 
 export interface GeminiAnalysis {
@@ -51,6 +52,7 @@ export interface GeminiAnalysis {
   observations: string[];
   recommendations: string;
   complianceLevel: 'Conforme' | 'Surveillance' | 'Critique';
+  anomalousPKs: string[];
 }
 
 export interface SessionRecord {
